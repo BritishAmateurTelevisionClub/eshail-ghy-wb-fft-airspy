@@ -1,0 +1,14 @@
+[Unit]
+Description=AirSpy FFT WS Server
+After=syslog.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/stdbuf -oL -eL {{directory}}/airspy_fft_ws
+WorkingDirectory={{directory}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

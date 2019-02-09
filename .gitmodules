@@ -1,0 +1,6 @@
+[submodule "libwebsockets"]
+	path = libwebsockets
+	url = https://github.com/warmcat/libwebsockets.git
+[submodule "libairspy"]
+	path = libairspy
+	url = https://github.com/airspy/airspyone_host.git
