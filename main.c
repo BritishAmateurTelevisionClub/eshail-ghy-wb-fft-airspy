@@ -301,7 +301,7 @@ void fft_to_string(void)
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
     	/* minus is removed to compress the data */
-        fftRow = json_mknumber(roundf(-10.0*fft_buffer.data[j]));
+        fftRow = json_mknumber(roundf(-10.0*fft_buffer.data[j])-fft_line_compensation[j]);
         json_append_element(fftArray, fftRow);
     }
 
