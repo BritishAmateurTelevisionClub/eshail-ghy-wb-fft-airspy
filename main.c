@@ -1,14 +1,13 @@
 #include "main.h"
 
 #define WS_PORT         7681
-
-#define FFT_INTERVAL    5 // milliseconds
+#define WS_INTERVAL		250
 
 #define FFT_SIZE        1024
-#define FFT_TIME_SMOOTH 0.97f // 0.0 - 1.0
+#define FFT_TIME_SMOOTH 0.999f // 0.0 - 1.0
 
 #define AIRSPY_FREQ     745000000
-//#define AIRSPY_FREQ     956000000
+
 #define AIRSPY_SAMPLE   10000000
 
 #define AIRSPY_SERIAL	0x644064DC2354AACD // WB
@@ -25,7 +24,7 @@ pthread_t fftThread;
 struct airspy_device* device = NULL;
 /* Sample type -> 32bit Complex Float */
 enum airspy_sample_type sample_type_val = AIRSPY_SAMPLE_FLOAT32_IQ;
-/* Sample rate -> 6MSps */
+/* Sample rate */
 uint32_t sample_rate_val = AIRSPY_SAMPLE;
 /* DC Bias Tee -> 0 (disabled) */
 uint32_t biast_val = 0;
@@ -160,12 +159,16 @@ static uint8_t setup_airspy()
 }
 
 typedef struct {
-	char data[FFT_SIZE*2 * FLOAT32_EL_SIZE_BYTE];
+	uint32_t index;
+	uint32_t size;
+	char data[65536 * FLOAT32_EL_SIZE_BYTE];
 	pthread_mutex_t mutex;
 	pthread_cond_t 	signal;
 } rf_buffer_t;
 
 rf_buffer_t rf_buffer = {
+	.index = 0,
+	.size = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.signal = PTHREAD_COND_INITIALIZER,
 };
@@ -173,14 +176,18 @@ rf_buffer_t rf_buffer = {
 /* Airspy RX Callback, this is called by a new thread within libairspy */
 int airspy_rx(airspy_transfer_t* transfer)
 {    
-    if(transfer->samples != NULL && transfer->sample_count>=(FFT_SIZE*2))
+	/* transfer->sample_count is normally 65536 */
+	/* TODO: I think sample_count is counting 2 for each complex sample (ie. absolute number of samples) */
+    if(transfer->samples != NULL && transfer->sample_count>=65536)
     {
         pthread_mutex_lock(&rf_buffer.mutex);
+        rf_buffer.index = 0;
         memcpy(
             rf_buffer.data,
-            &((double *)transfer->samples)[transfer->sample_count-(FFT_SIZE*2)],
-            (FFT_SIZE*2 * FLOAT32_EL_SIZE_BYTE)
+            transfer->samples,
+            (65536 * FLOAT32_EL_SIZE_BYTE)
         );
+        rf_buffer.size = transfer->sample_count / (FFT_SIZE * 2); // Number of potential FFTs
         pthread_cond_signal(&rf_buffer.signal);
         pthread_mutex_unlock(&rf_buffer.mutex);
     }
@@ -197,34 +204,36 @@ fft_buffer_t fft_buffer = {
 };
 
 /* FFT Thread */
-
 void *thread_fft(void *dummy)
 {
     (void) dummy;
-    int             i;
+    int             i, offset;
     fftw_complex    pt;
-    float           pwr, lpwr;
+    double           pwr, lpwr;
 
 	double pwr_scale = 1.0 / ((float)FFT_SIZE * (float)FFT_SIZE);
-
-    struct timespec ts;
-    ts.tv_sec = (FFT_INTERVAL - 1) / 1000;
-    ts.tv_nsec = ((FFT_INTERVAL - 1) % 1000) * 1000000;
 
     while(1)
     {
     	/* Lock input buffer */
     	pthread_mutex_lock(&rf_buffer.mutex);
 
-    	/* Wait for signalled input */
-    	pthread_cond_wait(&rf_buffer.signal, &rf_buffer.mutex);
+    	if(rf_buffer.index == rf_buffer.size)
+    	{
+	    	/* Wait for signalled input */
+	    	pthread_cond_wait(&rf_buffer.signal, &rf_buffer.mutex);
+    	}
+
+    	offset = rf_buffer.index * FFT_SIZE * 2;
 
     	/* Copy data out of rf buffer into fft_input buffer */
     	for (i = 0; i < FFT_SIZE; i++)
 	    {
-	        fft_in[i][0] = ((float*)rf_buffer.data)[2*i];
-	        fft_in[i][1] = ((float*)rf_buffer.data)[(2*i)+1];
+	        fft_in[i][0] = ((float*)rf_buffer.data)[offset+(2*i)];
+	        fft_in[i][1] = ((float*)rf_buffer.data)[offset+(2*i)+1];
 	    }
+
+	    rf_buffer.index++;
 
 	    /* Unlock input buffer */
     	pthread_mutex_unlock(&rf_buffer.mutex);
@@ -250,29 +259,28 @@ void *thread_fft(void *dummy)
 	        }
 	        pwr = pwr_scale * (pt[0] * pt[0]) + (pt[1] * pt[1]);
 	        lpwr = 10.f * log10(pwr + 1.0e-20);
-
-	        //gain = (100.f + lpwr) / 50.f;
-	        //gain = gain + ((1.f - gain) * (1.f - FFT_TIME_SMOOTH));
 	        
 	        fft_buffer.data[i] = (lpwr * (1.f - FFT_TIME_SMOOTH)) + (fft_buffer.data[i] * FFT_TIME_SMOOTH);
 	    }
 
 	    /* Unlock output buffer */
     	pthread_mutex_unlock(&fft_buffer.mutex);
-
-	    nanosleep(&ts, NULL);
     }
 
 }
 
 #define WEBSOCKET_OUTPUT_LENGTH	16384
-typedef struct
-{
+typedef struct {
 	char string[WEBSOCKET_OUTPUT_LENGTH];
 	int length;
+	pthread_mutex_t mutex;
 } websocket_output_t;
 
-websocket_output_t websocket_output = { .string = "\0", .length = 0 };
+websocket_output_t websocket_output = {
+	.string = "\0",
+	.length = 0,
+	.mutex = PTHREAD_MUTEX_INITIALIZER
+};
 
 void fft_to_string(void)
 {
@@ -290,7 +298,7 @@ void fft_to_string(void)
     pthread_mutex_lock(&fft_buffer.mutex);
 
     /* Create and append data points */
-    for(j=0;j<FFT_SIZE;j++)
+    for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
     	/* minus is removed to compress the data */
         fftRow = json_mknumber(roundf(-10.0*fft_buffer.data[j]));
@@ -309,12 +317,17 @@ void fft_to_string(void)
     /* Malloc and print JSON string into passed pointer */
     fft_string = json_stringify(jsonData, NULL);
 
+    pthread_mutex_lock(&websocket_output.mutex);
+
     strncpy(&websocket_output.string[LWS_PRE], fft_string, (WEBSOCKET_OUTPUT_LENGTH-(LWS_PRE+1)));
     websocket_output.string[WEBSOCKET_OUTPUT_LENGTH-1] = '\0';
 
     websocket_output.length = strlen(&websocket_output.string[LWS_PRE]);
+
+	pthread_mutex_unlock(&websocket_output.mutex);
     
     /* Clean up JSON objects*/
+    free(fft_string);
     json_delete(jsonData);
 }
 
@@ -327,14 +340,18 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 	{
 		case LWS_CALLBACK_SERVER_WRITEABLE:
 			/* Write output data, if data exists */
+			pthread_mutex_lock(&websocket_output.mutex);
 			if(websocket_output.length != 0)
 			{
 				n = lws_write(wsi, (unsigned char*)&websocket_output.string[LWS_PRE], websocket_output.length, LWS_WRITE_TEXT);
-				if (!n) {
+				if (!n)
+				{
+					pthread_mutex_unlock(&websocket_output.mutex);
 					lwsl_err("ERROR %d writing to socket\n", n);
 					return -1;
 				}
 			}
+			pthread_mutex_unlock(&websocket_output.mutex);
 			
 			break;
 
@@ -375,12 +392,18 @@ enum demo_protocols {
 /* list of supported protocols and callbacks */
 static struct lws_protocols protocols[] = {
 	{
-		"fft",
-		callback_fft,
-		0,
-		16384, /* rx buf size must be >= permessage-deflate rx size */
+		.name = "fft",
+		.callback = callback_fft,
+		.per_session_data_size = 0,
+		.rx_buffer_size = 16384, /* rx buf size must be >= permessage-deflate rx size */
 	},
-	{ NULL, NULL, 0, 0 } /* terminator */
+	{
+		/* terminator */
+		.name = NULL,
+		.callback = NULL,
+		.per_session_data_size = 0,
+		.rx_buffer_size = 0
+	}
 };
 
 void sighandler(int sig)
@@ -485,7 +508,7 @@ int main(int argc, char **argv)
 		gettimeofday(&tv, NULL);
 
 		ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-		if ((ms - oldms) > 250)
+		if ((ms - oldms) > WS_INTERVAL)
 		{
 			/* Convert latest FFT data to JSON string */
 			fft_to_string();
