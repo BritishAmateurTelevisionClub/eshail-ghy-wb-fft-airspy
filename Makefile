@@ -19,7 +19,6 @@ BIN = airspy_fft_ws
 SRCDIR = .
 
 SRC = 	$(SRCDIR)/libairspy/libairspy/src/*.c \
-		$(SRCDIR)/json/json.c \
 		$(SRCDIR)/main.c
 
 # ========================================================================================

@@ -34,7 +34,6 @@
 #include <pthread.h>
 #include <math.h>
 #include <fftw3.h>
-#include "json/json.h"
 #include "libairspy/libairspy/src/airspy.h"
 
 int32_t fft_line_compensation[1024] = {

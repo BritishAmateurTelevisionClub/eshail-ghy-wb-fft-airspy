@@ -271,64 +271,40 @@ void *thread_fft(void *dummy)
 
 #define WEBSOCKET_OUTPUT_LENGTH	16384
 typedef struct {
-	char string[WEBSOCKET_OUTPUT_LENGTH];
-	int length;
+	uint8_t buffer[LWS_PRE+WEBSOCKET_OUTPUT_LENGTH];
+	uint32_t length;
 	pthread_mutex_t mutex;
 } websocket_output_t;
 
 websocket_output_t websocket_output = {
-	.string = "\0",
 	.length = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
 void fft_to_string(void)
 {
-	int j;
-	char *fft_string;
-	JsonNode *jsonData;
-	JsonNode *fftArray;
-	JsonNode *fftRow;
-
-	/* Create larger objects first */
-    jsonData = json_mkobject();
-    fftArray = json_mkarray();
+	int i, j;
 
     /* Lock FFT output buffer for reading */
     pthread_mutex_lock(&fft_buffer.mutex);
 
+    /* Lock websocket output buffer for writing */
+    pthread_mutex_lock(&websocket_output.mutex);
+
     /* Create and append data points */
+    i = 0;
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
-    	/* minus is removed to compress the data */
-        fftRow = json_mknumber(roundf(-10.0*fft_buffer.data[j])-fft_line_compensation[j]);
-        json_append_element(fftArray, fftRow);
+    	*(uint16_t *)&websocket_output.buffer[LWS_PRE+(2*i)] = (uint16_t)((3100*(fft_buffer.data[j] - 34003))) + (350*fft_line_compensation[j]);
+    	i++;
     }
+
+    websocket_output.length = 2*i;
+
+	pthread_mutex_unlock(&websocket_output.mutex);
 
     /* Unlock FFT output buffer */
     pthread_mutex_unlock(&fft_buffer.mutex);
-
-    /* Add array to JSON object to complete object */
-    json_append_member(jsonData, "fft", fftArray);
-
-    /* Free string if currently allocated */
-	websocket_output.length = 0;
-    
-    /* Malloc and print JSON string into passed pointer */
-    fft_string = json_stringify(jsonData, NULL);
-
-    pthread_mutex_lock(&websocket_output.mutex);
-
-    strncpy(&websocket_output.string[LWS_PRE], fft_string, (WEBSOCKET_OUTPUT_LENGTH-(LWS_PRE+1)));
-    websocket_output.string[WEBSOCKET_OUTPUT_LENGTH-1] = '\0';
-
-    websocket_output.length = strlen(&websocket_output.string[LWS_PRE]);
-
-	pthread_mutex_unlock(&websocket_output.mutex);
-    
-    /* Clean up JSON objects*/
-    free(fft_string);
-    json_delete(jsonData);
 }
 
 int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
@@ -343,7 +319,7 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 			pthread_mutex_lock(&websocket_output.mutex);
 			if(websocket_output.length != 0)
 			{
-				n = lws_write(wsi, (unsigned char*)&websocket_output.string[LWS_PRE], websocket_output.length, LWS_WRITE_TEXT);
+				n = lws_write(wsi, (unsigned char*)&websocket_output.buffer[LWS_PRE], websocket_output.length, LWS_WRITE_BINARY);
 				if (!n)
 				{
 					pthread_mutex_unlock(&websocket_output.mutex);
@@ -510,7 +486,7 @@ int main(int argc, char **argv)
 		ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
 		if ((ms - oldms) > WS_INTERVAL)
 		{
-			/* Convert latest FFT data to JSON string */
+			/* Copy latest FFT data to WS Output Buffer */
 			fft_to_string();
 
 			/* Trigger send on all websockets */
