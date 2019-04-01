@@ -269,7 +269,7 @@ void *thread_fft(void *dummy)
 
 }
 
-#define WEBSOCKET_OUTPUT_LENGTH	16384
+#define WEBSOCKET_OUTPUT_LENGTH	4096
 typedef struct {
 	uint8_t buffer[LWS_PRE+WEBSOCKET_OUTPUT_LENGTH];
 	uint32_t length;
@@ -371,14 +371,11 @@ static struct lws_protocols protocols[] = {
 		.name = "fft",
 		.callback = callback_fft,
 		.per_session_data_size = 0,
-		.rx_buffer_size = 16384, /* rx buf size must be >= permessage-deflate rx size */
+		.rx_buffer_size = 4096,
 	},
 	{
 		/* terminator */
-		.name = NULL,
-		.callback = NULL,
-		.per_session_data_size = 0,
-		.rx_buffer_size = 0
+		0
 	}
 };
 
@@ -388,33 +385,6 @@ void sighandler(int sig)
 	force_exit = 1;
 	lws_cancel_service(context);
 }
-
-static const struct lws_extension exts[] = {
-	{
-		"permessage-deflate",
-		lws_extension_callback_pm_deflate,
-		"permessage-deflate"
-	},
-	{
-		"deflate-frame",
-		lws_extension_callback_pm_deflate,
-		"deflate_frame"
-	},
-	{ NULL, NULL, NULL /* terminator */ }
-};
-
-
-/*
-static struct option options[] = {
-	{ "help",	no_argument,		NULL, 'h' },
-	{ "debug",	required_argument,	NULL, 'd' },
-	{ "port",	required_argument,	NULL, 'p' },
-	{ "interface",  required_argument,	NULL, 'i' },
-	{ "closetest",  no_argument,		NULL, 'c' },
-	{ "libev",  no_argument,		NULL, 'e' },
-	{ NULL, 0, 0, 0 }
-};
-*/
 
 int main(int argc, char **argv)
 {
@@ -442,7 +412,6 @@ int main(int argc, char **argv)
 	info.uid = -1;
 	info.max_http_header_pool = 16;
 	info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
-	info.extensions = exts;
 	info.timeout_secs = 5;
 
     fprintf(stdout, "Initialising Websocket Server on port %d.. ",info.port);
