@@ -24,9 +24,10 @@ SRC = 	$(SRCDIR)/libairspy/libairspy/src/*.c \
 # ========================================================================================
 # External Libraries
 
-LIBSDIR = 
+LIBSDIR = libwebsockets/build/include
+OBSDIR = libwebsockets/build/lib
 
-LIBS = -lm -pthread -lsamplerate `pkg-config --libs libairspy` -lusb-1.0 -lfftw3 -lwebsockets
+LIBS = -lm -pthread `pkg-config --libs libairspy` -lusb-1.0 -lfftw3 -Wl,-Bstatic -lwebsockets -Wl,-Bdynamic
 
 CFLAGS += `pkg-config --cflags libairspy`
 
@@ -34,7 +35,9 @@ CFLAGS += `pkg-config --cflags libairspy`
 # Makerules
 
 all:
-	$(CC) $(COPT) $(CFLAGS) $(SRC) -o $(BIN) $(LIBSDIR) $(LIBS)
+	pkg-config --modversion "libairspy = 1.0"
+	pkg-config --modversion "libwebsockets = 3.1.0"
+	$(CC) $(COPT) $(CFLAGS) $(SRC) -o $(BIN) -I $(LIBSDIR) -L $(OBSDIR) $(LIBS)
 
 debug: COPT = -Og -ggdb -fno-omit-frame-pointer -D__DEBUG
 debug: all

@@ -171,6 +171,7 @@ rf_buffer_t rf_buffer = {
 	.size = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.signal = PTHREAD_COND_INITIALIZER,
+	.data = { 0xFF }
 };
 
 /* Airspy RX Callback, this is called by a new thread within libairspy */
@@ -273,51 +274,132 @@ void *thread_fft(void *dummy)
 typedef struct {
 	uint8_t buffer[LWS_PRE+WEBSOCKET_OUTPUT_LENGTH];
 	uint32_t length;
+	uint32_t sequence_id;
 	pthread_mutex_t mutex;
 } websocket_output_t;
 
 websocket_output_t websocket_output = {
 	.length = 0,
+	.sequence_id = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
+#define FLOOR_TARGET	9300
+#define FLOOR_TIME_SMOOTH 0.995
+
+uint16_t lowest_smooth = 11118; // value found in testing
+
 void fft_to_string(void)
 {
-	int i, j;
+	int32_t i, j;
+	uint16_t lowest, offset;
+	uint16_t *websocket_output_buffer_ptr;
 
     /* Lock FFT output buffer for reading */
     pthread_mutex_lock(&fft_buffer.mutex);
 
     /* Lock websocket output buffer for writing */
     pthread_mutex_lock(&websocket_output.mutex);
+    websocket_output_buffer_ptr = (uint16_t *)&websocket_output.buffer[LWS_PRE];
 
     /* Create and append data points */
     i = 0;
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
-    	*(uint16_t *)&websocket_output.buffer[LWS_PRE+(2*i)] = (uint16_t)((3100*(fft_buffer.data[j] - 34003))) + fft_line_compensation[j] + 2500;
+    	websocket_output_buffer_ptr[i] = (uint16_t)((3100*(fft_buffer.data[j] - 34003))) + fft_line_compensation[j] + 2500;
     	i++;
     }
 
-    websocket_output.length = 2*i;
-
-	pthread_mutex_unlock(&websocket_output.mutex);
-
     /* Unlock FFT output buffer */
     pthread_mutex_unlock(&fft_buffer.mutex);
+
+   	/* Calculate noise floor */
+   	lowest = 0xFFFF;
+   	for(j = 0; j < i; j++)
+    {
+    	if(websocket_output_buffer_ptr[j] < lowest)
+    	{
+    		lowest = websocket_output_buffer_ptr[j];
+    	}
+    }
+    lowest_smooth = (lowest * (1.f - FLOOR_TIME_SMOOTH)) + (lowest_smooth * FLOOR_TIME_SMOOTH);
+
+    /* Compensate for noise floor */
+    offset = FLOOR_TARGET - lowest_smooth;
+    //printf("smooth: %d, offset: %d\n", lowest_smooth,offset);
+    for(j = 0; j < i; j++)
+    {
+    	websocket_output_buffer_ptr[j] += offset;
+    }
+
+    websocket_output.length = 2*i;
+    websocket_output.sequence_id++;
+
+	pthread_mutex_unlock(&websocket_output.mutex);
 }
+
+typedef struct websocket_user_session_t websocket_user_session_t;
+
+struct websocket_user_session_t {
+	struct lws *wsi;
+	websocket_user_session_t *websocket_user_session_list;
+	uint32_t last_sequence_id;
+};
+
+typedef struct {
+	struct lws_context *context;
+	struct lws_vhost *vhost;
+	const struct lws_protocols *protocol;
+	websocket_user_session_t *websocket_user_session_list;
+} websocket_vhost_session_t;
 
 int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
 {
-	(void) user;
-	int n;
+	int32_t n;
+	websocket_user_session_t *user_session = (websocket_user_session_t *)user;
+
+	websocket_vhost_session_t *vhost_session =
+			(websocket_vhost_session_t *)
+			lws_protocol_vh_priv_get(lws_get_vhost(wsi),
+					lws_get_protocol(wsi));
 
 	switch (reason)
 	{
+		case LWS_CALLBACK_PROTOCOL_INIT:
+			vhost_session = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
+					lws_get_protocol(wsi),
+					sizeof(websocket_vhost_session_t));
+			vhost_session->context = lws_get_context(wsi);
+			vhost_session->protocol = lws_get_protocol(wsi);
+			vhost_session->vhost = lws_get_vhost(wsi);
+			break;
+
+		case LWS_CALLBACK_ESTABLISHED:
+			/* add ourselves to the list of live pss held in the vhd */
+			lws_ll_fwd_insert(
+				user_session,
+				websocket_user_session_list,
+				vhost_session->websocket_user_session_list
+			);
+			user_session->wsi = wsi;
+			//user_session->last = vhost_session->current;
+			break;
+
+		case LWS_CALLBACK_CLOSED:
+			/* remove our closing pss from the list of live pss */
+			lws_ll_fwd_remove(
+				websocket_user_session_t,
+				websocket_user_session_list,
+				user_session,
+				vhost_session->websocket_user_session_list
+			);
+			break;
+
+
 		case LWS_CALLBACK_SERVER_WRITEABLE:
 			/* Write output data, if data exists */
 			pthread_mutex_lock(&websocket_output.mutex);
-			if(websocket_output.length != 0)
+			if(websocket_output.length != 0 && user_session->last_sequence_id != websocket_output.sequence_id)
 			{
 				n = lws_write(wsi, (unsigned char*)&websocket_output.buffer[LWS_PRE], websocket_output.length, LWS_WRITE_BINARY);
 				if (!n)
@@ -326,33 +408,23 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 					lwsl_err("ERROR %d writing to socket\n", n);
 					return -1;
 				}
+				user_session->last_sequence_id = websocket_output.sequence_id;
 			}
 			pthread_mutex_unlock(&websocket_output.mutex);
 			
 			break;
 
-		case LWS_CALLBACK_ESTABLISHED:
-		    /* Connection Established */
-			break;
-
 		case LWS_CALLBACK_RECEIVE:
 			if (len < 6)
 				break;
-			if (strcmp((const char *)in, "closeme\n") == 0) {
+			if (strcmp((const char *)in, "closeme\n") == 0)
+			{
 				lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
 						 (unsigned char *)"seeya", 5);
 				return -1;
 			}
 			break;
 		
-		case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE:
-			lwsl_notice("LWS_CALLBACK_WS_PEER_INITIATED_CLOSE: len %d\n",
-				    len);
-			for (n = 0; n < (int)len; n++)
-				lwsl_notice(" %d: 0x%02X\n", n,
-					    ((unsigned char *)in)[n]);
-			break;
-
 		default:
 			break;
 	}
@@ -370,7 +442,7 @@ static struct lws_protocols protocols[] = {
 	{
 		.name = "fft",
 		.callback = callback_fft,
-		.per_session_data_size = 0,
+		.per_session_data_size = 128,
 		.rx_buffer_size = 4096,
 	},
 	{
@@ -414,7 +486,7 @@ int main(int argc, char **argv)
 	info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
 	info.timeout_secs = 5;
 
-    fprintf(stdout, "Initialising Websocket Server on port %d.. ",info.port);
+    fprintf(stdout, "Initialising Websocket Server (LWS %d) on port %d.. ",LWS_LIBRARY_VERSION_NUMBER,info.port);
     fflush(stdout);
 	context = lws_create_context(&info);
 	if (context == NULL)
@@ -443,6 +515,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error creating FFT thread\n");
 		return -1;
 	}
+	pthread_setname_np(fftThread, "airspy_fft_ws: FFT Calculation Thread");
 	fprintf(stdout, "Done.\n");
 
     fprintf(stdout, "Server running.\n");

@@ -26,11 +26,11 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <assert.h>
-#include <libwebsockets.h>
 #include <syslog.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <libwebsockets.h>
 #include <pthread.h>
 #include <math.h>
 #include <fftw3.h>
