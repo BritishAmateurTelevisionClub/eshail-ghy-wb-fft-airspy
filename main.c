@@ -307,7 +307,7 @@ void fft_to_string(void)
     i = 0;
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
-    	websocket_output_buffer_ptr[i] = (uint16_t)((3100*(fft_buffer.data[j] - 34003))) + fft_line_compensation[j] + 2500;
+    	websocket_output_buffer_ptr[i] = (uint16_t)((3000*(fft_buffer.data[j] - 33999))) + fft_line_compensation[j] + 5000;
     	i++;
     }
 
