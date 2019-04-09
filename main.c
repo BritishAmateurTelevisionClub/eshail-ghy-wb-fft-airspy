@@ -37,6 +37,7 @@ uint32_t sensitivity_gain_val = 10; // MAX=21
 /* Frequency */
 uint32_t freq_hz = AIRSPY_FREQ;
 
+double hanning_window_const[FFT_SIZE];
 
 int airspy_rx(airspy_transfer_t* transfer);
 
@@ -230,8 +231,8 @@ void *thread_fft(void *dummy)
     	/* Copy data out of rf buffer into fft_input buffer */
     	for (i = 0; i < FFT_SIZE; i++)
 	    {
-	        fft_in[i][0] = ((float*)rf_buffer.data)[offset+(2*i)];
-	        fft_in[i][1] = ((float*)rf_buffer.data)[offset+(2*i)+1];
+	        fft_in[i][0] = ((float*)rf_buffer.data)[offset+(2*i)] * hanning_window_const[i];
+	        fft_in[i][1] = ((float*)rf_buffer.data)[offset+(2*i)+1] * hanning_window_const[i];
 	    }
 
 	    rf_buffer.index++;
@@ -465,7 +466,7 @@ int main(int argc, char **argv)
 	struct lws_context_creation_info info;
 	struct timeval tv;
 	unsigned int ms, oldms = 0;
-	int n = 0;
+	int n = 0, i;
 
 	signal(SIGINT, sighandler);
 
@@ -507,6 +508,10 @@ int main(int argc, char **argv)
 	fprintf(stdout, "Initialising FFT (%d bin).. ", FFT_SIZE);
 	fflush(stdout);
 	setup_fft();
+	for(i=0; i<FFT_SIZE; i++)
+	{
+		hanning_window_const[i] = 0.5 * (1.0 - cos(2*M_PI*(((double)i)/FFT_SIZE)));
+	}
 	fprintf(stdout, "Done.\n");
 	
 	fprintf(stdout, "Starting FFT Thread.. ");
