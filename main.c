@@ -293,7 +293,8 @@ uint16_t lowest_smooth = 11118; // value found in testing
 void fft_to_string(void)
 {
 	int32_t i, j;
-	uint16_t lowest, offset;
+    uint32_t output;
+    uint16_t lowest, offset;
 	uint16_t *websocket_output_buffer_ptr;
 
     /* Lock FFT output buffer for reading */
@@ -307,8 +308,16 @@ void fft_to_string(void)
     i = 0;
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
-    	websocket_output_buffer_ptr[i] = (uint16_t)((3000*(fft_buffer.data[j] - 33999))) + fft_line_compensation[j] + 5000;
-    	i++;
+        output = ((uint32_t)(3000*fft_buffer.data[j]) & 0xFFFF) + fft_line_compensation[j] - 17980;
+	if(output & 0xFFFF0000)
+	{
+	    websocket_output_buffer_ptr[i] = 0xFFFF;
+	}
+	else
+	{
+	    websocket_output_buffer_ptr[i] = (uint16_t)output;
+        }
+	i++;
     }
 
     /* Unlock FFT output buffer */
