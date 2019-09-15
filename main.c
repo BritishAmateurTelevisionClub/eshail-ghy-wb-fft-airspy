@@ -1,4 +1,5 @@
 #include "main.h"
+#include <float.h>
 
 #define WS_PORT         7681
 #define WS_INTERVAL		250
@@ -46,12 +47,25 @@ fftw_complex* fft_in;
 fftw_complex*   fft_out;
 fftw_plan   fft_plan;
 
+static const char *fftw_wisdom_filename = ".fftw_wisdom";
+
 void setup_fft(void)
 {
+    int i;
     /* Set up FFTW */
     fft_in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
     fft_out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
-    fft_plan = fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_PATIENT);
+    i = fftw_import_wisdom_from_filename(fftw_wisdom_filename);
+    if(i == 0)
+    {
+        fprintf(stdout, "Computing plan...");
+	fflush(stdout);
+    }
+    fft_plan = fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_EXHAUSTIVE);
+    if(i == 0)
+    {
+        fftw_export_wisdom_to_filename(fftw_wisdom_filename);
+    }
 }
 
 static void close_airspy(void)
@@ -82,6 +96,7 @@ static void close_fftw(void)
     fftw_free(fft_in);
     fftw_free(fft_out);
     fftw_destroy_plan(fft_plan);
+    fftw_forget_wisdom();
 }
 
 static uint8_t setup_airspy()
@@ -159,10 +174,13 @@ static uint8_t setup_airspy()
     return 1;
 }
 
+/* transfer->sample_count is normally 65536 */
+#define	AIRSPY_BUFFER_COPY_SIZE	65536
+
 typedef struct {
 	uint32_t index;
 	uint32_t size;
-	char data[65536 * FLOAT32_EL_SIZE_BYTE];
+	char data[AIRSPY_BUFFER_COPY_SIZE * FLOAT32_EL_SIZE_BYTE];
 	pthread_mutex_t mutex;
 	pthread_cond_t 	signal;
 } rf_buffer_t;
@@ -172,24 +190,22 @@ rf_buffer_t rf_buffer = {
 	.size = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.signal = PTHREAD_COND_INITIALIZER,
-	.data = { 0xFF }
+	.data = { 0 }
 };
 
 /* Airspy RX Callback, this is called by a new thread within libairspy */
 int airspy_rx(airspy_transfer_t* transfer)
 {    
-	/* transfer->sample_count is normally 65536 */
-	/* TODO: I think sample_count is counting 2 for each complex sample (ie. absolute number of samples) */
-    if(transfer->samples != NULL && transfer->sample_count>=65536)
+    if(transfer->samples != NULL && transfer->sample_count >= AIRSPY_BUFFER_COPY_SIZE)
     {
         pthread_mutex_lock(&rf_buffer.mutex);
         rf_buffer.index = 0;
         memcpy(
             rf_buffer.data,
             transfer->samples,
-            (65536 * FLOAT32_EL_SIZE_BYTE)
+            (AIRSPY_BUFFER_COPY_SIZE * FLOAT32_EL_SIZE_BYTE)
         );
-        rf_buffer.size = transfer->sample_count / (FFT_SIZE * 2); // Number of potential FFTs
+        rf_buffer.size = AIRSPY_BUFFER_COPY_SIZE / (FFT_SIZE * 2);
         pthread_cond_signal(&rf_buffer.signal);
         pthread_mutex_unlock(&rf_buffer.mutex);
     }
@@ -285,16 +301,20 @@ websocket_output_t websocket_output = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
-#define FLOOR_TARGET	9300
+#define FFT_OFFSET  80.1
+#define FFT_SCALE   3000.0
+
+#define FLOOR_TARGET	8500
 #define FLOOR_TIME_SMOOTH 0.995
 
-uint16_t lowest_smooth = 11118; // value found in testing
+uint16_t lowest_smooth = FLOOR_TARGET;
 
 void fft_to_string(void)
 {
 	int32_t i, j;
     uint32_t output;
-    uint16_t lowest, offset;
+    uint16_t lowest;
+    int32_t offset;
 	uint16_t *websocket_output_buffer_ptr;
 
     /* Lock FFT output buffer for reading */
@@ -306,19 +326,34 @@ void fft_to_string(void)
 
     /* Create and append data points */
     i = 0;
+    //uint32_t min = 0xFFFFFFFF, max = 0;
+    //float fmin = FLT_MAX, fmax = -FLT_MAX; 
     for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
     {
-        output = ((uint32_t)(3000*fft_buffer.data[j]) & 0xFFFF) + fft_line_compensation[j] - 17980;
-	if(output & 0xFFFF0000)
-	{
-	    websocket_output_buffer_ptr[i] = 0xFFFF;
-	}
-	else
-	{
-	    websocket_output_buffer_ptr[i] = (uint16_t)output;
+        output = (uint32_t)(FFT_SCALE * (fft_buffer.data[j] + FFT_OFFSET)) + fft_line_compensation[j];
+        //if(fft_buffer.data[j] > fmax) fmax = fft_buffer.data[j];
+        //if(fft_buffer.data[j] < fmin) fmin = fft_buffer.data[j];
+        //if(output > max) max = output;
+        //if(output < min) min = output;
+
+        if(output > 0xFFFF)
+        {
+            websocket_output_buffer_ptr[i] = 0xFFFF;
         }
-	i++;
+        else
+        {
+            websocket_output_buffer_ptr[i] = (uint16_t)(output & 0xFFFF);
+        }
+
+        //if(websocket_output_buffer_ptr[i] > max) max = websocket_output_buffer_ptr[i];
+        //if(websocket_output_buffer_ptr[i] < min) min = websocket_output_buffer_ptr[i];
+
+        i++;
     }
+    //printf("min: %"PRIu32"\n", min);
+    //printf("max: %"PRIu32"\n", max);
+    //printf("fmin: %f\n", fmin);
+    //printf("fmax: %f\n", fmax);
 
     /* Unlock FFT output buffer */
     pthread_mutex_unlock(&fft_buffer.mutex);
@@ -336,10 +371,13 @@ void fft_to_string(void)
 
     /* Compensate for noise floor */
     offset = FLOOR_TARGET - lowest_smooth;
-    //printf("smooth: %d, offset: %d\n", lowest_smooth,offset);
+    //printf("lowest_smooth: %d, offset: %d\n", lowest_smooth,offset);
     for(j = 0; j < i; j++)
     {
-    	websocket_output_buffer_ptr[j] += offset;
+	if(__builtin_add_overflow(websocket_output_buffer_ptr[j], offset, &websocket_output_buffer_ptr[j]))
+	{
+	  websocket_output_buffer_ptr[j] = 0xFFFF;
+	}
     }
 
     websocket_output.length = 2*i;
@@ -464,6 +502,7 @@ static struct lws_protocols protocols[] = {
 void sighandler(int sig)
 {
 	(void) sig;
+	
 	force_exit = 1;
 	lws_cancel_service(context);
 }
@@ -472,10 +511,12 @@ int main(int argc, char **argv)
 {
 	(void) argc;
 	(void) argv;
+
 	struct lws_context_creation_info info;
 	struct timeval tv;
 	unsigned int ms, oldms = 0;
-	int n = 0, i;
+	int lws_err = 0;
+	int i;
 
 	signal(SIGINT, sighandler);
 
@@ -487,7 +528,7 @@ int main(int argc, char **argv)
 	lws_set_log_level(debug_level, lwsl_emit_syslog);
 
 	memset(&info, 0, sizeof info);
-    info.port = WS_PORT;
+	info.port = WS_PORT;
 	info.iface = NULL;
 	info.protocols = protocols;
 	info.gid = -1;
@@ -496,8 +537,17 @@ int main(int argc, char **argv)
 	info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
 	info.timeout_secs = 5;
 
-    fprintf(stdout, "Initialising Websocket Server (LWS %d) on port %d.. ",LWS_LIBRARY_VERSION_NUMBER,info.port);
-    fflush(stdout);
+	fprintf(stdout, "Initialising FFT (%d bin).. ", FFT_SIZE);
+	fflush(stdout);
+	setup_fft();
+	for(i=0; i<FFT_SIZE; i++)
+	{
+		hanning_window_const[i] = 0.5 * (1.0 - cos(2*M_PI*(((double)i)/FFT_SIZE)));
+	}
+	fprintf(stdout, "Done.\n");
+	
+	fprintf(stdout, "Initialising Websocket Server (LWS %d) on port %d.. ",LWS_LIBRARY_VERSION_NUMBER,info.port);
+	fflush(stdout);
 	context = lws_create_context(&info);
 	if (context == NULL)
 	{
@@ -514,15 +564,6 @@ int main(int argc, char **argv)
 	}
 	fprintf(stdout, "Done.\n");
 	
-	fprintf(stdout, "Initialising FFT (%d bin).. ", FFT_SIZE);
-	fflush(stdout);
-	setup_fft();
-	for(i=0; i<FFT_SIZE; i++)
-	{
-		hanning_window_const[i] = 0.5 * (1.0 - cos(2*M_PI*(((double)i)/FFT_SIZE)));
-	}
-	fprintf(stdout, "Done.\n");
-	
 	fprintf(stdout, "Starting FFT Thread.. ");
 	if (pthread_create(&fftThread, NULL, thread_fft, NULL))
 	{
@@ -532,10 +573,10 @@ int main(int argc, char **argv)
 	pthread_setname_np(fftThread, "airspy_fft_ws: FFT Calculation Thread");
 	fprintf(stdout, "Done.\n");
 
-    fprintf(stdout, "Server running.\n");
-    fflush(stdout);
+	fprintf(stdout, "Server running.\n");
+	fflush(stdout);
 
-	while (n >= 0 && !force_exit)
+	while (!(lws_err < 0) && !force_exit)
 	{
 		gettimeofday(&tv, NULL);
 
@@ -552,11 +593,10 @@ int main(int argc, char **argv)
 			oldms = ms;
 		}
 		
-        /* Service websockets, else wait 50ms */
-		n = lws_service(context, 10);
+		/* Service websockets, else wait 10ms */
+		lws_err = lws_service(context, 10);
 	}
 
-    /* TODO: Catch SIG for graceful exit */
 	lws_context_destroy(context);
 	close_airspy();
 	close_fftw();
