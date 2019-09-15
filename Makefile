@@ -5,9 +5,14 @@
 # ========================================================================================
 # Compile flags
 
-CC = gcc
-COPT = -O3 -march=native
-CFLAGS = -Wall -Wextra -std=gnu11 -D_GNU_SOURCE
+ifneq (, $(shell which gcc-8))
+  CC = gcc-8
+else
+  CC = gcc
+endif
+
+COPT = -O2 -march=native -mtune=native
+CFLAGS = -Wall -Wextra -Wpedantic -std=gnu11 -D_GNU_SOURCE
 CFLAGS += -D BUILD_VERSION="\"$(shell git describe --dirty --always)\""	\
 		-D BUILD_DATE="\"$(shell date '+%Y-%m-%d_%H:%M:%S')\""
 
@@ -35,8 +40,8 @@ CFLAGS += `pkg-config --cflags libairspy`
 # Makerules
 
 all:
-	pkg-config --modversion "libairspy = 1.0"
-	pkg-config --modversion "libwebsockets = 3.1.0"
+	@pkg-config --modversion "libairspy = 1.0"
+	@pkg-config --modversion "libwebsockets = 3.1.0"
 	$(CC) $(COPT) $(CFLAGS) $(SRC) -o $(BIN) -I $(LIBSDIR) -L $(OBSDIR) $(LIBS)
 
 debug: COPT = -Og -ggdb -fno-omit-frame-pointer -D__DEBUG
