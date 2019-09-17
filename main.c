@@ -2,7 +2,8 @@
 #include <float.h>
 
 #define WS_PORT         7681
-#define WS_INTERVAL		250
+#define WS_INTERVAL         250
+#define WS_INTERVAL_FAST    100
 
 #define FFT_SIZE        1024
 #define FFT_TIME_SMOOTH 0.999f // 0.0 - 1.0
@@ -301,6 +302,12 @@ websocket_output_t websocket_output = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
+websocket_output_t websocket_output_fast = {
+    .length = 0,
+    .sequence_id = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER
+};
+
 #define FFT_OFFSET  80.1
 #define FFT_SCALE   3000.0
 
@@ -309,7 +316,7 @@ websocket_output_t websocket_output = {
 
 uint16_t lowest_smooth = FLOOR_TARGET;
 
-void fft_to_string(void)
+void fft_to_buffer(websocket_output_t *_websocket_output)
 {
 	int32_t i, j;
     uint32_t output;
@@ -321,8 +328,8 @@ void fft_to_string(void)
     pthread_mutex_lock(&fft_buffer.mutex);
 
     /* Lock websocket output buffer for writing */
-    pthread_mutex_lock(&websocket_output.mutex);
-    websocket_output_buffer_ptr = (uint16_t *)&websocket_output.buffer[LWS_PRE];
+    pthread_mutex_lock(&_websocket_output->mutex);
+    websocket_output_buffer_ptr = (uint16_t *)&_websocket_output->buffer[LWS_PRE];
 
     /* Create and append data points */
     i = 0;
@@ -380,10 +387,10 @@ void fft_to_string(void)
 	}
     }
 
-    websocket_output.length = 2*i;
-    websocket_output.sequence_id++;
+    _websocket_output->length = 2*i;
+    _websocket_output->sequence_id++;
 
-	pthread_mutex_unlock(&websocket_output.mutex);
+	pthread_mutex_unlock(&_websocket_output->mutex);
 }
 
 typedef struct websocket_user_session_t websocket_user_session_t;
@@ -480,8 +487,88 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 	return 0;
 }
 
+int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+{
+    int32_t n;
+    websocket_user_session_t *user_session = (websocket_user_session_t *)user;
+
+    websocket_vhost_session_t *vhost_session =
+            (websocket_vhost_session_t *)
+            lws_protocol_vh_priv_get(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi));
+
+    switch (reason)
+    {
+        case LWS_CALLBACK_PROTOCOL_INIT:
+            vhost_session = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi),
+                    sizeof(websocket_vhost_session_t));
+            vhost_session->context = lws_get_context(wsi);
+            vhost_session->protocol = lws_get_protocol(wsi);
+            vhost_session->vhost = lws_get_vhost(wsi);
+            break;
+
+        case LWS_CALLBACK_ESTABLISHED:
+            /* add ourselves to the list of live pss held in the vhd */
+            lws_ll_fwd_insert(
+                user_session,
+                websocket_user_session_list,
+                vhost_session->websocket_user_session_list
+            );
+            user_session->wsi = wsi;
+            //user_session->last = vhost_session->current;
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            /* remove our closing pss from the list of live pss */
+            lws_ll_fwd_remove(
+                websocket_user_session_t,
+                websocket_user_session_list,
+                user_session,
+                vhost_session->websocket_user_session_list
+            );
+            break;
+
+
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            /* Write output data, if data exists */
+            pthread_mutex_lock(&websocket_output_fast.mutex);
+            if(websocket_output_fast.length != 0 && user_session->last_sequence_id != websocket_output_fast.sequence_id)
+            {
+                n = lws_write(wsi, (unsigned char*)&websocket_output_fast.buffer[LWS_PRE], websocket_output_fast.length, LWS_WRITE_BINARY);
+                if (!n)
+                {
+                    pthread_mutex_unlock(&websocket_output_fast.mutex);
+                    lwsl_err("ERROR %d writing to socket\n", n);
+                    return -1;
+                }
+                user_session->last_sequence_id = websocket_output_fast.sequence_id;
+            }
+            pthread_mutex_unlock(&websocket_output_fast.mutex);
+            
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            if (len < 6)
+                break;
+            if (strcmp((const char *)in, "closeme\n") == 0)
+            {
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
+                         (unsigned char *)"seeya", 5);
+                return -1;
+            }
+            break;
+        
+        default:
+            break;
+    }
+
+    return 0;
+}
+
 enum demo_protocols {
 	PROTOCOL_FFT,
+    PROTOCOL_FFT_FAST,
 	NOP
 };
 
@@ -493,6 +580,12 @@ static struct lws_protocols protocols[] = {
 		.per_session_data_size = 128,
 		.rx_buffer_size = 4096,
 	},
+    {
+        .name = "fft_fast",
+        .callback = callback_fft_fast,
+        .per_session_data_size = 128,
+        .rx_buffer_size = 4096,
+    },
 	{
 		/* terminator */
 		0
@@ -514,7 +607,7 @@ int main(int argc, char **argv)
 
 	struct lws_context_creation_info info;
 	struct timeval tv;
-	unsigned int ms, oldms = 0;
+	unsigned int ms, oldms = 0, oldms_fast = 0;
 	int lws_err = 0;
 	int i;
 
@@ -584,7 +677,7 @@ int main(int argc, char **argv)
 		if ((ms - oldms) > WS_INTERVAL)
 		{
 			/* Copy latest FFT data to WS Output Buffer */
-			fft_to_string();
+			fft_to_buffer(&websocket_output);
 
 			/* Trigger send on all websockets */
 			lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT]);
@@ -592,6 +685,17 @@ int main(int argc, char **argv)
 			/* Reset timer */
 			oldms = ms;
 		}
+        if ((ms - oldms_fast) > WS_INTERVAL_FAST)
+        {
+            /* Copy latest FFT data to WS Output Buffer */
+            fft_to_buffer(&websocket_output_fast);
+
+            /* Trigger send on all websockets */
+            lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT_FAST]);
+
+            /* Reset timer */
+            oldms_fast = ms;
+        }
 		
 		/* Service websockets, else wait 10ms */
 		lws_err = lws_service(context, 10);
