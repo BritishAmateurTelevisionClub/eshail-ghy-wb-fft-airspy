@@ -8,7 +8,7 @@
 #define FFT_SIZE        1024
 #define FFT_TIME_SMOOTH 0.999f // 0.0 - 1.0
 
-#define AIRSPY_FREQ     745000000
+#define AIRSPY_FREQ     745250000
 
 #define AIRSPY_SAMPLE   10000000
 
@@ -19,8 +19,26 @@ int max_poll_elements;
 int debug_level = 3;
 volatile int force_exit = 0;
 struct lws_context *context;
+uint32_t lws_count_fft = 0;
+uint32_t lws_count_fft_fast = 0;
+uint32_t lws_count_fft_m0dtslivetune = 0;
+#define STDOUT_INTERVAL_CONNCOUNT 30*1000
 
 pthread_t fftThread;
+pthread_t wsThread;
+
+static void sleep_ms(uint32_t _duration)
+{
+    struct timespec req, rem;
+    req.tv_sec = _duration / 1000;
+    req.tv_nsec = (_duration - (req.tv_sec*1000))*1000*1000;
+
+    while(nanosleep(&req, &rem) == EINTR)
+    {
+        /* Interrupted by signal, shallow copy remaining time into request, and resume */
+        req = rem;
+    }
+}
 
 /** AirSpy Vars **/
 struct airspy_device* device = NULL;
@@ -308,83 +326,109 @@ websocket_output_t websocket_output_fast = {
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
-#define FFT_OFFSET  80.1
+
+/* OLD
+#define FFT_OFFSET  85
 #define FFT_SCALE   3000.0
 
-#define FLOOR_TARGET	8500
+
+#define FLOOR_TARGET    8500
+#define FLOOR_TIME_SMOOTH 0.995
+*/
+
+#define FFT_PRESCALE 3.0
+
+#define FFT_OFFSET  92
+#define FFT_SCALE   (FFT_PRESCALE * 3000)
+
+
+#define FLOOR_TARGET	(FFT_PRESCALE * 47000)
 #define FLOOR_TIME_SMOOTH 0.995
 
-uint16_t lowest_smooth = FLOOR_TARGET;
+#define FLOOR_OFFSET    (FFT_PRESCALE * 38000)
 
+static uint32_t lowest_smooth = FLOOR_TARGET;
+
+static uint32_t fft_output_data[FFT_SIZE];
 void fft_to_buffer(websocket_output_t *_websocket_output)
 {
 	int32_t i, j;
-    uint32_t output;
-    uint16_t lowest;
+    uint32_t lowest;
     int32_t offset;
 	uint16_t *websocket_output_buffer_ptr;
-
-    /* Lock FFT output buffer for reading */
-    pthread_mutex_lock(&fft_buffer.mutex);
-
-    /* Lock websocket output buffer for writing */
-    pthread_mutex_lock(&_websocket_output->mutex);
-    websocket_output_buffer_ptr = (uint16_t *)&_websocket_output->buffer[LWS_PRE];
 
     /* Create and append data points */
     i = 0;
     //uint32_t min = 0xFFFFFFFF, max = 0;
     //float fmin = FLT_MAX, fmax = -FLT_MAX; 
-    for(j=(FFT_SIZE*0.1);j<(FFT_SIZE*0.9);j++)
+
+    /* Lock FFT output buffer for reading */
+    pthread_mutex_lock(&fft_buffer.mutex);
+
+    for(j=(FFT_SIZE*0.05);j<(FFT_SIZE*0.95);j++)
     {
-        output = (uint32_t)(FFT_SCALE * (fft_buffer.data[j] + FFT_OFFSET)) + fft_line_compensation[j];
+        fft_output_data[i] = (uint32_t)(FFT_SCALE * (fft_buffer.data[j] + FFT_OFFSET)) + (FFT_PRESCALE*fft_line_compensation[j]); // (fft_line_compensation[j] / 3.0);
         //if(fft_buffer.data[j] > fmax) fmax = fft_buffer.data[j];
         //if(fft_buffer.data[j] < fmin) fmin = fft_buffer.data[j];
-        //if(output > max) max = output;
-        //if(output < min) min = output;
 
-        if(output > 0xFFFF)
-        {
-            websocket_output_buffer_ptr[i] = 0xFFFF;
-        }
-        else
-        {
-            websocket_output_buffer_ptr[i] = (uint16_t)(output & 0xFFFF);
-        }
-
-        //if(websocket_output_buffer_ptr[i] > max) max = websocket_output_buffer_ptr[i];
-        //if(websocket_output_buffer_ptr[i] < min) min = websocket_output_buffer_ptr[i];
+        //if(fft_output_data[i]  > max) max = fft_output_data[i] ;
+        //if(fft_output_data[i]  < min) min = fft_output_data[i] ;
 
         i++;
     }
+
+    /* Unlock FFT output buffer */
+    pthread_mutex_unlock(&fft_buffer.mutex);
+
     //printf("min: %"PRIu32"\n", min);
     //printf("max: %"PRIu32"\n", max);
     //printf("fmin: %f\n", fmin);
     //printf("fmax: %f\n", fmax);
 
-    /* Unlock FFT output buffer */
-    pthread_mutex_unlock(&fft_buffer.mutex);
-
    	/* Calculate noise floor */
-   	lowest = 0xFFFF;
-   	for(j = 0; j < i; j++)
+   	lowest = 0xFFFFFFFF;
+   	for(j = (FFT_SIZE*0.05); j < i - (FFT_SIZE*0.1); j++)
     {
-    	if(websocket_output_buffer_ptr[j] < lowest)
+    	if(fft_output_data[j] < lowest)
     	{
-    		lowest = websocket_output_buffer_ptr[j];
+    		lowest = fft_output_data[j];
     	}
     }
     lowest_smooth = (lowest * (1.f - FLOOR_TIME_SMOOTH)) + (lowest_smooth * FLOOR_TIME_SMOOTH);
 
     /* Compensate for noise floor */
-    offset = FLOOR_TARGET - lowest_smooth;
-    //printf("lowest_smooth: %d, offset: %d\n", lowest_smooth,offset);
+    offset = (FLOOR_TARGET) - lowest_smooth;
+    //printf("lowest: %d, lowest_smooth: %d, offset: %d\n", lowest, lowest_smooth, offset);
+
     for(j = 0; j < i; j++)
     {
-	if(__builtin_add_overflow(websocket_output_buffer_ptr[j], offset, &websocket_output_buffer_ptr[j]))
-	{
-	  websocket_output_buffer_ptr[j] = 0xFFFF;
-	}
+        /* Add noise-floor AGC offset (can be negative) */
+        fft_output_data[j] += offset;
+
+        /* Subtract viewport floor offset and set to zero if underflow */
+        if(__builtin_usub_overflow(fft_output_data[j], (uint32_t)FLOOR_OFFSET, &fft_output_data[j]))
+        {
+            fft_output_data[j] = 0;
+        }
+
+        /* Divide output by FFT_PRESCALE to scale for uint16_t */
+        fft_output_data[j] /= FFT_PRESCALE;
+
+        /* Catch data overflow */
+        if(fft_output_data[j] > 0xFFFF)
+        {
+            fft_output_data[j] = 0xFFFF;
+        }
+    }
+
+    /* Lock websocket output buffer for writing */
+    pthread_mutex_lock(&_websocket_output->mutex);
+    websocket_output_buffer_ptr = (uint16_t *)&_websocket_output->buffer[LWS_PRE];
+
+    /* Copy data into websocket output buffer */
+    for(j = 0; j < i; j++)
+    {
+        websocket_output_buffer_ptr[j] = fft_output_data[j];
     }
 
     _websocket_output->length = 2*i;
@@ -396,8 +440,8 @@ void fft_to_buffer(websocket_output_t *_websocket_output)
 typedef struct websocket_user_session_t websocket_user_session_t;
 
 struct websocket_user_session_t {
+    websocket_user_session_t *websocket_user_session_list;
 	struct lws *wsi;
-	websocket_user_session_t *websocket_user_session_list;
 	uint32_t last_sequence_id;
 };
 
@@ -410,6 +454,9 @@ typedef struct {
 
 int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
 {
+    (void)in;
+    (void)len;
+    
 	int32_t n;
 	websocket_user_session_t *user_session = (websocket_user_session_t *)user;
 
@@ -437,7 +484,12 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 				vhost_session->websocket_user_session_list
 			);
 			user_session->wsi = wsi;
-			//user_session->last = vhost_session->current;
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft = n;
 			break;
 
 		case LWS_CALLBACK_CLOSED:
@@ -448,6 +500,12 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 				user_session,
 				vhost_session->websocket_user_session_list
 			);
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft = n;
 			break;
 
 
@@ -470,14 +528,7 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 			break;
 
 		case LWS_CALLBACK_RECEIVE:
-			if (len < 6)
-				break;
-			if (strcmp((const char *)in, "closeme\n") == 0)
-			{
-				lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
-						 (unsigned char *)"seeya", 5);
-				return -1;
-			}
+			/* Not expecting to receive anything */
 			break;
 		
 		default:
@@ -487,8 +538,11 @@ int callback_fft(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 	return 0;
 }
 
-int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+int callback_fft_modtslivetune(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
 {
+    (void)in;
+    (void)len;
+    
     int32_t n;
     websocket_user_session_t *user_session = (websocket_user_session_t *)user;
 
@@ -516,7 +570,12 @@ int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *u
                 vhost_session->websocket_user_session_list
             );
             user_session->wsi = wsi;
-            //user_session->last = vhost_session->current;
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_m0dtslivetune = n;
             break;
 
         case LWS_CALLBACK_CLOSED:
@@ -527,6 +586,98 @@ int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *u
                 user_session,
                 vhost_session->websocket_user_session_list
             );
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_m0dtslivetune = n;
+            break;
+
+
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            /* Write output data, if data exists */
+            pthread_mutex_lock(&websocket_output.mutex);
+            if(websocket_output.length != 0 && user_session->last_sequence_id != websocket_output.sequence_id)
+            {
+                n = lws_write(wsi, (unsigned char*)&websocket_output.buffer[LWS_PRE], websocket_output.length, LWS_WRITE_BINARY);
+                if (!n)
+                {
+                    pthread_mutex_unlock(&websocket_output.mutex);
+                    lwsl_err("ERROR %d writing to socket\n", n);
+                    return -1;
+                }
+                user_session->last_sequence_id = websocket_output.sequence_id;
+            }
+            pthread_mutex_unlock(&websocket_output.mutex);
+            
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            /* Not expecting to receive anything */
+            break;
+        
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+{
+    (void)in;
+    (void)len;
+
+    int32_t n;
+    websocket_user_session_t *user_session = (websocket_user_session_t *)user;
+
+    websocket_vhost_session_t *vhost_session =
+            (websocket_vhost_session_t *)
+            lws_protocol_vh_priv_get(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi));
+
+    switch (reason)
+    {
+        case LWS_CALLBACK_PROTOCOL_INIT:
+            vhost_session = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi),
+                    sizeof(websocket_vhost_session_t));
+            vhost_session->context = lws_get_context(wsi);
+            vhost_session->protocol = lws_get_protocol(wsi);
+            vhost_session->vhost = lws_get_vhost(wsi);
+            break;
+
+        case LWS_CALLBACK_ESTABLISHED:
+            /* add ourselves to the list of live pss held in the vhd */
+            lws_ll_fwd_insert(
+                user_session,
+                websocket_user_session_list,
+                vhost_session->websocket_user_session_list
+            );
+            user_session->wsi = wsi;
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_fast = n;
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            /* remove our closing pss from the list of live pss */
+            lws_ll_fwd_remove(
+                websocket_user_session_t,
+                websocket_user_session_list,
+                user_session,
+                vhost_session->websocket_user_session_list
+            );
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_fast = n;
             break;
 
 
@@ -549,14 +700,7 @@ int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *u
             break;
 
         case LWS_CALLBACK_RECEIVE:
-            if (len < 6)
-                break;
-            if (strcmp((const char *)in, "closeme\n") == 0)
-            {
-                lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
-                         (unsigned char *)"seeya", 5);
-                return -1;
-            }
+            /* Not expecting to receive anything */
             break;
         
         default:
@@ -568,6 +712,7 @@ int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *u
 
 enum demo_protocols {
 	PROTOCOL_FFT,
+    PROTOCOL_FFT_M0DTSLIVETUNE,
     PROTOCOL_FFT_FAST,
 	NOP
 };
@@ -581,6 +726,12 @@ static struct lws_protocols protocols[] = {
 		.rx_buffer_size = 4096,
 	},
     {
+        .name = "fft_m0dtslivetune",
+        .callback = callback_fft_modtslivetune,
+        .per_session_data_size = 128,
+        .rx_buffer_size = 4096,
+    },
+    {
         .name = "fft_fast",
         .callback = callback_fft_fast,
         .per_session_data_size = 128,
@@ -591,6 +742,20 @@ static struct lws_protocols protocols[] = {
 		0
 	}
 };
+
+int lws_err = 0;
+/* Websocket Service Thread */
+void *thread_ws(void *dummy)
+{
+    (void) dummy;
+
+    while(!(lws_err < 0) && !force_exit)
+    {
+        lws_err = lws_service(context, 0);
+    }
+
+    return NULL;
+}
 
 void sighandler(int sig)
 {
@@ -607,8 +772,7 @@ int main(int argc, char **argv)
 
 	struct lws_context_creation_info info;
 	struct timeval tv;
-	unsigned int ms, oldms = 0, oldms_fast = 0;
-	int lws_err = 0;
+	unsigned int ms, oldms = 0, oldms_fast = 0, oldms_conn_count = 0;
 	int i;
 
 	signal(SIGINT, sighandler);
@@ -663,8 +827,17 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error creating FFT thread\n");
 		return -1;
 	}
-	pthread_setname_np(fftThread, "airspy_fft_ws: FFT Calculation Thread");
+	pthread_setname_np(fftThread, "FFT Calculation");
 	fprintf(stdout, "Done.\n");
+
+    fprintf(stdout, "Starting Websocket Service Thread.. ");
+    if (pthread_create(&wsThread, NULL, thread_ws, NULL))
+    {
+        fprintf(stderr, "Error creating Websocket Service thread\n");
+        return -1;
+    }
+    pthread_setname_np(wsThread, "Websocket Srv");
+    fprintf(stdout, "Done.\n");
 
 	fprintf(stdout, "Server running.\n");
 	fflush(stdout);
@@ -681,6 +854,7 @@ int main(int argc, char **argv)
 
 			/* Trigger send on all websockets */
 			lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT]);
+            lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT_M0DTSLIVETUNE]);
 
 			/* Reset timer */
 			oldms = ms;
@@ -696,12 +870,25 @@ int main(int argc, char **argv)
             /* Reset timer */
             oldms_fast = ms;
         }
+        if ((ms - oldms_conn_count) > STDOUT_INTERVAL_CONNCOUNT)
+        {
+            fprintf(stdout, "Connections: fft: %d, fft_m0dtslivetune: %d, fft_fast: %d\n",
+                lws_count_fft,
+                lws_count_fft_m0dtslivetune,
+                lws_count_fft_fast
+            );
+
+            /* Reset timer */
+            oldms_conn_count = ms;
+        }
 		
-		/* Service websockets, else wait 10ms */
-		lws_err = lws_service(context, 10);
+        sleep_ms(10);
 	}
 
-	lws_context_destroy(context);
+    /* Wait for ws thread to terminate before destroying ws */
+    pthread_join(wsThread, NULL);
+    lws_context_destroy(context);
+
 	close_airspy();
 	close_fftw();
 	closelog();
