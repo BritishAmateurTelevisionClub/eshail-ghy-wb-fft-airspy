@@ -1,6 +1,8 @@
 #include "main.h"
 #include <float.h>
 
+/*** Remember to talk to Rob M0DTS about his minitiune click software before making changes! ***/
+
 #define WS_PORT         7681
 #define WS_INTERVAL         250
 #define WS_INTERVAL_FAST    100
@@ -8,7 +10,7 @@
 #define FFT_SIZE        1024
 #define FFT_TIME_SMOOTH 0.999f // 0.0 - 1.0
 
-#define AIRSPY_FREQ     745250000
+#define AIRSPY_FREQ     745000000
 
 #define AIRSPY_SAMPLE   10000000
 
