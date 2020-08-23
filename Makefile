@@ -41,7 +41,6 @@ CFLAGS += `pkg-config --cflags libairspy`
 
 all:
 	@pkg-config --modversion "libairspy = 1.0"
-	@pkg-config --modversion "libwebsockets = 3.1.0"
 	$(CC) $(COPT) $(CFLAGS) $(SRC) -o $(BIN) -I $(LIBSDIR) -L $(OBSDIR) $(LIBS)
 
 debug: COPT = -Og -ggdb -fno-omit-frame-pointer -D__DEBUG
