@@ -25,6 +25,7 @@ uint32_t lws_count_fft = 0;
 uint32_t lws_count_fft_fast = 0;
 uint32_t lws_count_fft_m0dtslivetune = 0;
 uint32_t lws_count_fft_f5oeoplutofw = 0;
+uint32_t lws_count_fft_ea7kirsatcontroller = 0;
 #define STDOUT_INTERVAL_CONNCOUNT 30*1000
 
 pthread_t fftThread;
@@ -713,6 +714,92 @@ int callback_fft_f5oeoplutofw(struct lws *wsi, enum lws_callback_reasons reason,
     return 0;
 }
 
+int callback_fft_ea7kirsatcontroller(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+{
+    (void)in;
+    (void)len;
+    
+    int32_t n;
+    websocket_user_session_t *user_session = (websocket_user_session_t *)user;
+
+    websocket_vhost_session_t *vhost_session =
+            (websocket_vhost_session_t *)
+            lws_protocol_vh_priv_get(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi));
+
+    switch (reason)
+    {
+        case LWS_CALLBACK_PROTOCOL_INIT:
+            vhost_session = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
+                    lws_get_protocol(wsi),
+                    sizeof(websocket_vhost_session_t));
+            vhost_session->context = lws_get_context(wsi);
+            vhost_session->protocol = lws_get_protocol(wsi);
+            vhost_session->vhost = lws_get_vhost(wsi);
+            break;
+
+        case LWS_CALLBACK_ESTABLISHED:
+            /* add ourselves to the list of live pss held in the vhd */
+            lws_ll_fwd_insert(
+                user_session,
+                websocket_user_session_list,
+                vhost_session->websocket_user_session_list
+            );
+            user_session->wsi = wsi;
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_ea7kirsatcontroller = n;
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            /* remove our closing pss from the list of live pss */
+            lws_ll_fwd_remove(
+                websocket_user_session_t,
+                websocket_user_session_list,
+                user_session,
+                vhost_session->websocket_user_session_list
+            );
+            /* Update connection count */
+            n = 0;
+            lws_start_foreach_ll(websocket_user_session_t *, ___pss, vhost_session->websocket_user_session_list) {
+                n++;
+            } lws_end_foreach_ll(___pss, websocket_user_session_list);
+            lws_count_fft_ea7kirsatcontroller = n;
+            break;
+
+
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            /* Write output data, if data exists */
+            pthread_mutex_lock(&websocket_output.mutex);
+            if(websocket_output.length != 0 && user_session->last_sequence_id != websocket_output.sequence_id)
+            {
+                n = lws_write(wsi, (unsigned char*)&websocket_output.buffer[LWS_PRE], websocket_output.length, LWS_WRITE_BINARY);
+                if (!n)
+                {
+                    pthread_mutex_unlock(&websocket_output.mutex);
+                    lwsl_err("ERROR %d writing to socket\n", n);
+                    return -1;
+                }
+                user_session->last_sequence_id = websocket_output.sequence_id;
+            }
+            pthread_mutex_unlock(&websocket_output.mutex);
+            
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            /* Not expecting to receive anything */
+            break;
+        
+        default:
+            break;
+    }
+
+    return 0;
+}
+
 int callback_fft_fast(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
 {
     (void)in;
@@ -803,6 +890,7 @@ enum demo_protocols {
 	PROTOCOL_FFT,
     PROTOCOL_FFT_M0DTSLIVETUNE,
     PROTOCOL_FFT_F5OEOPLUTOFW,
+    PROTOCOL_FFT_EA7KIRSATCONTROLLER,
     PROTOCOL_FFT_FAST,
 	NOP
 };
@@ -824,6 +912,12 @@ static struct lws_protocols protocols[] = {
     {
         .name = "fft_f5oeoplutofw",
         .callback = callback_fft_f5oeoplutofw,
+        .per_session_data_size = 128,
+        .rx_buffer_size = 4096,
+    },
+    {
+        .name = "fft_ea7kirsatcontroller",
+        .callback = callback_fft_ea7kirsatcontroller,
         .per_session_data_size = 128,
         .rx_buffer_size = 4096,
     },
@@ -952,6 +1046,7 @@ int main(int argc, char **argv)
 			lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT]);
             lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT_M0DTSLIVETUNE]);
             lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT_F5OEOPLUTOFW]);
+            lws_callback_on_writable_all_protocol(context, &protocols[PROTOCOL_FFT_EA7KIRSATCONTROLLER]);
 
 			/* Reset timer */
 			oldms = ms;
@@ -969,10 +1064,11 @@ int main(int argc, char **argv)
         }
         if ((ms - oldms_conn_count) > STDOUT_INTERVAL_CONNCOUNT)
         {
-            fprintf(stdout, "Connections: fft: %d, fft_m0dtslivetune: %d, fft_f5oeoplutofw: %d, fft_fast: %d\n",
+            fprintf(stdout, "Connections: fft: %d, fft_m0dtslivetune: %d, fft_f5oeoplutofw: %d, fft_ea7kirsatcontroller: %d, fft_fast: %d\n",
                 lws_count_fft,
                 lws_count_fft_m0dtslivetune,
                 lws_count_fft_f5oeoplutofw,
+                lws_count_fft_ea7kirsatcontroller,
                 lws_count_fft_fast
             );
 
