@@ -8,7 +8,7 @@
 #define WS_INTERVAL_FAST    100
 
 #define FFT_SIZE        1024
-#define FFT_TIME_SMOOTH 0.999f // 0.0 - 1.0
+#define FFT_TIME_SMOOTH 0.9995f // 0.0 - 1.0
 
 #define AIRSPY_FREQ     745000000
 
@@ -228,7 +228,8 @@ int airspy_rx(airspy_transfer_t* transfer)
             transfer->samples,
             (AIRSPY_BUFFER_COPY_SIZE * FLOAT32_EL_SIZE_BYTE)
         );
-        rf_buffer.size = AIRSPY_BUFFER_COPY_SIZE / (FFT_SIZE * 2);
+        /* Double size as we're running half overlap on the FFTs, but then minus one so we don't overrun the end */
+        rf_buffer.size = (2 * (AIRSPY_BUFFER_COPY_SIZE / (FFT_SIZE * 2))) - 1;
         pthread_cond_signal(&rf_buffer.signal);
         pthread_mutex_unlock(&rf_buffer.mutex);
     }
@@ -265,7 +266,8 @@ void *thread_fft(void *dummy)
 	    	pthread_cond_wait(&rf_buffer.signal, &rf_buffer.mutex);
     	}
 
-    	offset = rf_buffer.index * FFT_SIZE * 2;
+    	/* Move forward half an FFT length, giving half an FFT of overlap */
+    	offset = (rf_buffer.index * FFT_SIZE * 2) / 2;
 
     	/* Copy data out of rf buffer into fft_input buffer */
     	for (i = 0; i < FFT_SIZE; i++)
