@@ -300,7 +300,7 @@ void *thread_fft(void *dummy)
 	            pt[0] = fft_out[i - FFT_SIZE / 2][0] / FFT_SIZE;
 	            pt[1] = fft_out[i - FFT_SIZE / 2][1] / FFT_SIZE;
 	        }
-	        pwr = pwr_scale * (pt[0] * pt[0]) + (pt[1] * pt[1]);
+	        pwr = pwr_scale * ((pt[0] * pt[0]) + (pt[1] * pt[1]));
 	        lpwr = 10.f * log10(pwr + 1.0e-20);
 	        
 	        fft_buffer.data[i] = (lpwr * (1.f - FFT_TIME_SMOOTH)) + (fft_buffer.data[i] * FFT_TIME_SMOOTH);
@@ -344,8 +344,8 @@ websocket_output_t websocket_output_fast = {
 
 #define FFT_PRESCALE 3.0
 
-#define FFT_OFFSET  92
-#define FFT_SCALE   (FFT_PRESCALE * 3000)
+#define FFT_OFFSET  (150)
+#define FFT_SCALE   (9e3)
 
 
 #define FLOOR_TARGET	(FFT_PRESCALE * 47000)
@@ -373,12 +373,13 @@ void fft_to_buffer(websocket_output_t *_websocket_output)
 
     for(j=(FFT_SIZE*0.05);j<(FFT_SIZE*0.95);j++)
     {
-        fft_output_data[i] = (uint32_t)(FFT_SCALE * (fft_buffer.data[j] + FFT_OFFSET)) + (FFT_PRESCALE*fft_line_compensation[j]); // (fft_line_compensation[j] / 3.0);
+        fft_output_data[i] = (uint32_t)(FFT_SCALE * (fft_buffer.data[j] + FFT_OFFSET)) + (FFT_PRESCALE*fft_line_compensation[j]);
         //if(fft_buffer.data[j] > fmax) fmax = fft_buffer.data[j];
         //if(fft_buffer.data[j] < fmin) fmin = fft_buffer.data[j];
 
         //if(fft_output_data[i]  > max) max = fft_output_data[i] ;
         //if(fft_output_data[i]  < min) min = fft_output_data[i] ;
+
 
         i++;
     }
